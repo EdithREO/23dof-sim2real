@@ -8,7 +8,7 @@ Unitree G1（货架 23DoF 机型）上的 RMG `model_24500` 策略 sim2sim / SDK
 
 ## 第三方仓库（请单独 clone）
 
-本仓库不嵌入下面这些上游完整历史与编译产物。在同级目录执行：
+本仓库不嵌入上游完整历史与编译产物。在同级目录执行：
 
 ```bash
 git clone https://github.com/unitreerobotics/unitree_rl_mjlab.git
@@ -18,7 +18,14 @@ git clone https://github.com/unitreerobotics/unitree_mujoco.git
 git clone -b releases/0.10.x https://github.com/eclipse-cyclonedds/cyclonedds.git
 ```
 
-`unitree_mujoco` 仿真对接本策略时，把 `configs/unitree_mujoco.simulate.config.yaml` 拷到 `unitree_mujoco/simulate/config.yaml`（G1、`scene_23dof.xml`、DDS `lo`、吊带默认打开）。
+`unitree_mujoco` 相对上游有本地补丁（本仓库跟踪这些文件）：
+
+- `unitree_mujoco/simulate/src/main.cc` — 加载 squat stand keyframe，DDS hold 锁住前暂停
+- `unitree_mujoco/simulate/src/unitree_sdk2_bridge.h` — LowCmd 超时前用 PD 锁站姿
+- `unitree_mujoco/unitree_robots/g1/scene_23dof.xml` — `rmg_stand` keyframe
+- `unitree_mujoco/simulate/config.yaml` — G1、`scene_23dof.xml`、DDS `lo`、吊带关闭
+
+也可把 `configs/unitree_mujoco.simulate.config.yaml` 拷到 `unitree_mujoco/simulate/config.yaml`。
 
 ## Python sim2sim
 

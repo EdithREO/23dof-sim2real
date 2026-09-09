@@ -49,6 +49,19 @@ from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
 
 G1_NUM_MOTOR = 29
+# unitree_hg LowCmd/LowState motor index == g1_23dof.xml <actuator> order.
+# Policy (21) skips waist_roll/pitch (13/14) and all wrist pitch/yaw; locks wrist_roll.
+MOTOR_NAMES = (
+    "left_hip_pitch", "left_hip_roll", "left_hip_yaw",
+    "left_knee", "left_ankle_pitch", "left_ankle_roll",
+    "right_hip_pitch", "right_hip_roll", "right_hip_yaw",
+    "right_knee", "right_ankle_pitch", "right_ankle_roll",
+    "waist_yaw", "waist_roll", "waist_pitch",
+    "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw",
+    "left_elbow", "left_wrist_roll", "left_wrist_pitch", "left_wrist_yaw",
+    "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw",
+    "right_elbow", "right_wrist_roll", "right_wrist_pitch", "right_wrist_yaw",
+)
 POLICY_TO_MOTOR = (
     0, 1, 2, 3, 4, 5,
     6, 7, 8, 9, 10, 11,
@@ -56,9 +69,35 @@ POLICY_TO_MOTOR = (
     15, 16, 17, 18,
     22, 23, 24, 25,
 )
-# 23DoF 有腕 roll，策略没有；保持 0 位并给小刚度。
-HOLD_MOTORS = (19, 26)
+# 23DoF 有腕 roll，策略没有；锁在 0 位。
+HOLD_MOTORS = (19, 26)  # left_wrist_roll, right_wrist_roll
 G1_23DOF_MOTORS = tuple(sorted(set(POLICY_TO_MOTOR) | set(HOLD_MOTORS)))
+assert len(POLICY_TO_MOTOR) == 21
+assert HOLD_MOTORS == (19, 26)
+assert MOTOR_NAMES[19] == "left_wrist_roll" and MOTOR_NAMES[26] == "right_wrist_roll"
+assert all(MOTOR_NAMES[i] == n for i, n in zip(
+    POLICY_TO_MOTOR,
+    (
+        "left_hip_pitch", "left_hip_roll", "left_hip_yaw",
+        "left_knee", "left_ankle_pitch", "left_ankle_roll",
+        "right_hip_pitch", "right_hip_roll", "right_hip_yaw",
+        "right_knee", "right_ankle_pitch", "right_ankle_roll",
+        "waist_yaw",
+        "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw", "left_elbow",
+        "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw", "right_elbow",
+    ),
+))
+assert tuple(CANONICAL_POLICY_JOINT_ORDER) == (
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint",
+)
 
 DEPLOY_DEFAULT = np.array(
     [
@@ -300,6 +339,9 @@ class PolicyRuntime:
 
 
 def pack_full(policy_q: np.ndarray, policy_kp: np.ndarray, policy_kd: np.ndarray, policy_tau: np.ndarray):
+    """Pack 21 policy joints into 29-motor LowCmd; lock both wrist_roll at 0."""
+    if policy_q.shape[0] != N_ACT:
+        raise ValueError(f"policy_q dim {policy_q.shape[0]} != {N_ACT}")
     q = np.zeros(G1_NUM_MOTOR, dtype=np.float32)
     dq = np.zeros(G1_NUM_MOTOR, dtype=np.float32)
     kp = np.zeros(G1_NUM_MOTOR, dtype=np.float32)
@@ -310,11 +352,23 @@ def pack_full(policy_q: np.ndarray, policy_kp: np.ndarray, policy_kd: np.ndarray
         kp[mid] = policy_kp[i]
         kd[mid] = policy_kd[i]
         tau[mid] = policy_tau[i]
+    # Lock left/right wrist_roll (motors 19, 26); unused dummy motors stay kp=0.
     for mid in HOLD_MOTORS:
         q[mid] = 0.0
-        kp[mid] = 8.0
+        dq[mid] = 0.0
+        kp[mid] = 20.0
         kd[mid] = 1.0
+        tau[mid] = 0.0
     return q, dq, kp, kd, tau
+
+
+def print_motor_map() -> None:
+    print("[sdk] LowCmd motor map (policy 21 → unitree_hg 29; wrist_roll locked):")
+    for i, mid in enumerate(POLICY_TO_MOTOR):
+        print(f"  policy[{i:2d}] {CANONICAL_POLICY_JOINT_ORDER[i]:28s} -> motor[{mid:2d}] {MOTOR_NAMES[mid]}")
+    for mid in HOLD_MOTORS:
+        print(f"  LOCK                         -> motor[{mid:2d}] {MOTOR_NAMES[mid]} q=0")
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -328,6 +382,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="只读 SDK 状态并推理，不发 LowCmd")
     p.add_argument("--allow-real", action="store_true", help="允许对非 lo 网卡发指令（真机）")
     p.add_argument("--prepare-s", type=float, default=3.0, help="先从当前姿态平滑到参考首帧")
+    p.add_argument(
+        "--kp-scale",
+        type=float,
+        default=None,
+        help="缩放发给 SDK 的 kp（unitree_mujoco 动力学偏软，lo 上默认 8）",
+    )
     return p.parse_args()
 
 
@@ -346,9 +406,13 @@ def main() -> None:
     print(f"[sdk] waiting lowstate on {args.network} ...")
     io.wait_state()
     print(f"[sdk] got lowstate, mode_machine={io.mode_machine}")
+    print_motor_map()
 
     motion = MotionRef(args.motion_csv, args.csv_fps)
     policy = PolicyRuntime(args.onnx, motion)
+    kp_scale = float(args.kp_scale) if args.kp_scale is not None else (8.0 if args.network == "lo" else 1.0)
+    policy.kp = policy.kp * kp_scale
+    print(f"[sdk] kp_scale={kp_scale} (wrist_roll still locked at motors 19/26)")
     cmd_lock = threading.Lock()
     q_cmd, dq_cmd, kp_cmd, kd_cmd, tau_cmd = pack_full(
         DEPLOY_DEFAULT, policy.kp, policy.kd, np.zeros(N_ACT)
