@@ -18,12 +18,12 @@
 
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
-    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" friction="1 0.005 0.0001"/>
   </worldbody>
 
-  <!-- Deploy-default squat (21 policy DoF) + wrist_roll locked at 0.
-       Motor indices match unitree_hg LowCmd; L/R wrist_roll = 19/26. -->
+  <!-- CSV frame-0 of motion/neutral_held_50hz.csv (21 policy DoF) + wrist_roll/waist RP locked.
+       Root xy at origin; z/quat from CSV so mimic heading matches. L/R wrist_roll = 19/26. -->
   <keyframe>
-    <key name="rmg_stand" qpos="0 0 0.741698 1 0 0 0 -0.312 0 0 0.669 -0.363 0 -0.312 0 0 0.669 -0.363 0 0 0 0 0 0.87 0 0 0 0 0.87 0 0 0 0 0 0 0"/>
+    <key name="rmg_csv0" qpos="0 0 0.78674078 0.0091974912 -0.027653884 -0.011388296 0.99951035 0.045121301 0.069645442 0.49208075 0.10673729 -0.19398819 -0.0054474659 0.05798227 -0.088430569 -0.54423636 0.020472065 -0.085405186 0.031432502 -0.0212077 0.20863599 -0.026197113 0.29169938 1.0503081 0 0.19508635 -0.037376352 -0.10780466 1.2265681 0 0 0 0 0 0 0"/>
   </keyframe>
 </mujoco>

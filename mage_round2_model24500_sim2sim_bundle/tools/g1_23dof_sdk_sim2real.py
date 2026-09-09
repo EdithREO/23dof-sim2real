@@ -381,12 +381,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--command-mode", choices=("position", "torque"), default="position")
     p.add_argument("--dry-run", action="store_true", help="只读 SDK 状态并推理，不发 LowCmd")
     p.add_argument("--allow-real", action="store_true", help="允许对非 lo 网卡发指令（真机）")
-    p.add_argument("--prepare-s", type=float, default=3.0, help="先从当前姿态平滑到参考首帧")
+    p.add_argument("--prepare-s", type=float, default=3.0, help="先 PD 锁 CSV 首帧姿态，再交给策略")
     p.add_argument(
         "--kp-scale",
         type=float,
         default=None,
-        help="缩放发给 SDK 的 kp（unitree_mujoco 动力学偏软，lo 上默认 8）",
+        help="同时缩放发给 SDK 的 kp/kd（unitree_mujoco 动力学偏软，lo 上默认 8）",
     )
     return p.parse_args()
 
@@ -410,12 +410,17 @@ def main() -> None:
 
     motion = MotionRef(args.motion_csv, args.csv_fps)
     policy = PolicyRuntime(args.onnx, motion)
+    start_q = motion._interp(0.0)["dof"].astype(np.float32)
     kp_scale = float(args.kp_scale) if args.kp_scale is not None else (8.0 if args.network == "lo" else 1.0)
     policy.kp = policy.kp * kp_scale
-    print(f"[sdk] kp_scale={kp_scale} (wrist_roll still locked at motors 19/26)")
+    policy.kd = policy.kd * kp_scale
+    print(
+        f"[sdk] kp_scale={kp_scale} (kd scaled same; wrist_roll locked at motors 19/26; "
+        f"prepare holds CSV frame-0 for {args.prepare_s:.1f}s, q0={start_q[0]:.3f})"
+    )
     cmd_lock = threading.Lock()
     q_cmd, dq_cmd, kp_cmd, kd_cmd, tau_cmd = pack_full(
-        DEPLOY_DEFAULT, policy.kp, policy.kd, np.zeros(N_ACT)
+        start_q, policy.kp, policy.kd, np.zeros(N_ACT)
     )
 
     stop = threading.Event()
@@ -446,8 +451,8 @@ def main() -> None:
             last_policy = now
             q, dq, gyro, rpy = io.read_proprio()
             if now < args.prepare_s:
-                ratio = np.clip(now / max(args.prepare_s, 1e-3), 0.0, 1.0)
-                q_des = (1.0 - ratio) * q + ratio * motion._interp(0.0)["dof"]
+                # Hold CSV frame-0 so policy handoff does not yank from squat to ref.
+                q_des = start_q.copy()
                 tau = (q_des - q) * policy.kp - dq * policy.kd
             else:
                 t_motion = now - args.prepare_s
