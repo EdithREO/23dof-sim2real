@@ -1,0 +1,31 @@
+# Build / install
+**/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+**/install/
+**/*.o
+**/*.a
+**/*.so
+**/*.so.*
+**/*.pyc
+**/__pycache__/
+*.egg-info/
+.venv/
+.env
+.env.*
+
+# CycloneDDS local prefix
+cyclonedds/install/
+cyclonedds/build/
+
+# Heavy third-party binaries from mjlab deploy
+unitree_rl_mjlab/deploy/thirdparty/onnxruntime-*/
+unitree_rl_mjlab/**/*.onnx.data
+
+# Local MuJoCo / logs
+.mujoco/
+*.log
+.cursor/
+terminals/
