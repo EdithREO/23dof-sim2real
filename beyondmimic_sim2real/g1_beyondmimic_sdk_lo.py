@@ -198,19 +198,22 @@ class RobotIO:
         with self._lock:
             self.sport = msg
 
-    def wait(self, timeout_s: float = 20.0) -> None:
+    def wait(self, timeout_s: float = 20.0, need_sport: bool = True) -> None:
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             with self._lock:
-                if self.low_state is not None and self.sport is not None:
+                have_low = self.low_state is not None
+                have_sport = self.sport is not None
+                if have_low and (have_sport or not need_sport):
                     return
             time.sleep(0.01)
         with self._lock:
             got_low = self.low_state is not None
             got_sport = self.sport is not None
+        need = "lowstate" if not need_sport else "lowstate+sportmodestate"
         raise TimeoutError(
-            f"DDS timeout: lowstate={got_low} sportmodestate={got_sport}. "
-            "先开 unitree_mujoco，确认 interface=lo 且 domain_id 一致。"
+            f"DDS timeout ({need}): lowstate={got_low} sportmodestate={got_sport}. "
+            "确认网卡/domain、unitree_mujoco 或真机 debug 是否在发 rt/lowstate。"
         )
 
     def snapshot(self):
