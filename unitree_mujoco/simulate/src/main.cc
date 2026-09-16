@@ -99,6 +99,79 @@ namespace
   mjModel *m = nullptr;
   mjData *d = nullptr;
 
+  struct JointDynamics
+  {
+    const char *name;
+    mjtNum armature;
+  };
+
+  // Match the runtime conditioning used by the validated BeyondMimic direct
+  // MuJoCo deployment.  This changes only the simulation model; DDS messages,
+  // motor-slot semantics and the official SDK remain untouched.
+  void ApplyBeyondMimic23DoFDynamics(mjModel *model, const char *filename)
+  {
+    if (!model || !filename || std::string(filename).find("scene_23dof.xml") == std::string::npos)
+    {
+      return;
+    }
+
+    int disabled_meshes = 0;
+    for (int i = 0; i < model->ngeom; ++i)
+    {
+      if (model->geom_type[i] == mjGEOM_MESH)
+      {
+        model->geom_contype[i] = 0;
+        model->geom_conaffinity[i] = 0;
+        ++disabled_meshes;
+      }
+    }
+
+    constexpr JointDynamics kDynamics[] = {
+        {"left_hip_pitch_joint", 0.01017752004},
+        {"left_hip_roll_joint", 0.025101925},
+        {"left_hip_yaw_joint", 0.01017752004},
+        {"left_knee_joint", 0.025101925},
+        {"left_ankle_pitch_joint", 0.00721945},
+        {"left_ankle_roll_joint", 0.00721945},
+        {"right_hip_pitch_joint", 0.01017752004},
+        {"right_hip_roll_joint", 0.025101925},
+        {"right_hip_yaw_joint", 0.01017752004},
+        {"right_knee_joint", 0.025101925},
+        {"right_ankle_pitch_joint", 0.00721945},
+        {"right_ankle_roll_joint", 0.00721945},
+        {"waist_yaw_joint", 0.01017752004},
+        {"left_shoulder_pitch_joint", 0.003609725},
+        {"left_shoulder_roll_joint", 0.003609725},
+        {"left_shoulder_yaw_joint", 0.003609725},
+        {"left_elbow_joint", 0.003609725},
+        {"left_wrist_roll_joint", 0.003609725},
+        {"right_shoulder_pitch_joint", 0.003609725},
+        {"right_shoulder_roll_joint", 0.003609725},
+        {"right_shoulder_yaw_joint", 0.003609725},
+        {"right_elbow_joint", 0.003609725},
+        {"right_wrist_roll_joint", 0.003609725},
+    };
+
+    int calibrated_joints = 0;
+    for (const auto &joint : kDynamics)
+    {
+      const int joint_id = mj_name2id(model, mjOBJ_JOINT, joint.name);
+      if (joint_id < 0)
+      {
+        mju_warning("BeyondMimic dynamics: joint '%s' not found", joint.name);
+        continue;
+      }
+      const int dof_id = model->jnt_dofadr[joint_id];
+      model->dof_armature[dof_id] = joint.armature;
+      model->dof_damping[dof_id] = 0.0;
+      model->dof_frictionloss[dof_id] = 0.1;
+      ++calibrated_joints;
+    }
+
+    std::printf("[unitree_mujoco] BeyondMimic dynamics: disabled_meshes=%d calibrated_joints=%d\n",
+                disabled_meshes, calibrated_joints);
+  }
+
   // control noise variables
   mjtNum *ctrlnoise = nullptr;
 
@@ -561,6 +634,7 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
     mjData *dnew = nullptr;
     if (m)
     {
+      ApplyBeyondMimic23DoFDynamics(m, filename);
       // Apply stand keyframe BEFORE publishing global d so DDS bridge does not
       // latch hold-PD on the default straight-leg qpos0.
       dnew = mj_makeData(m);
@@ -588,16 +662,37 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
       ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
       mju_zero(ctrlnoise, m->nu);
 
-      // Pause until DDS bridge can latch hold-PD on the stand pose; otherwise
-      // the first free mj_step collapses the robot before LowCmd arrives.
+      // Keep physics paused until a controller publishes LowCmd. The bridge
+      // continues publishing state while paused, so a controller can connect
+      // and latch the current stand pose before the first free simulation step.
       if (param::config.enable_elastic_band == 0)
       {
         sim->run = 0;
-        std::printf("[unitree_mujoco] paused for bridge hold latch (3s), then auto-resume\n");
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+        first_lowcmd_received.store(false);
         ResetToStandKeyframe();
-        sim->run = 1;
-        std::printf("[unitree_mujoco] resumed\n");
+        std::printf("[unitree_mujoco] paused; waiting for first rt/lowcmd\n");
+        std::fflush(stdout);
+
+        const auto wait_start = std::chrono::steady_clock::now();
+        bool wait_warning_printed = false;
+        while (!first_lowcmd_received.load() && !sim->exitrequest.load())
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          if (!wait_warning_printed &&
+              std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(15))
+          {
+            std::printf("[unitree_mujoco] still paused; start a controller that publishes rt/lowcmd\n");
+            std::fflush(stdout);
+            wait_warning_printed = true;
+          }
+        }
+        if (first_lowcmd_received.load())
+        {
+          ResetToStandKeyframe();
+          sim->run = 1;
+          std::printf("[unitree_mujoco] first rt/lowcmd received; resumed\n");
+          std::fflush(stdout);
+        }
       }
     }
     else

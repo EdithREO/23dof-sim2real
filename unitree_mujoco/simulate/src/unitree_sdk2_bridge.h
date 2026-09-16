@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mujoco/mujoco.h>
 
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -17,6 +18,8 @@
 #include "physics_joystick.h"
 
 #define MOTOR_SENSOR_NUM 3
+
+inline std::atomic<bool> first_lowcmd_received{false};
 
 class UnitreeSDK2BridgeBase
 {
@@ -169,8 +172,13 @@ public:
 
     void start()
     {
+        // The simulator runs physics at 500 Hz and holds mj_data_->ctrl between
+        // bridge updates. Publishing both LowState and SportModeState at 1 kHz
+        // produces duplicate samples and can overflow the Python CycloneDDS
+        // reader used by the 50 Hz policy. Match the 500 Hz physics rate while
+        // leaving headroom for the policy and renderer.
         thread_ = std::make_shared<unitree::common::RecurrentThread>(
-            "unitree_bridge", UT_CPU_ID_NONE, 1000, [this]() { this->run(); });
+            "unitree_bridge", UT_CPU_ID_NONE, 2000, [this]() { this->run(); });
     }
 
     virtual void run()
@@ -205,6 +213,7 @@ public:
                         hold_kd * mj_data_->qvel[vadr];
                 }
             } else {
+                first_lowcmd_received.store(true);
                 for(int i(0); i<num_motor_; i++) {
                     auto & m = lowcmd->msg_.motor_cmd()[i];
                     mj_data_->ctrl[i] = m.tau() +
