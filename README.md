@@ -2,6 +2,8 @@
 
 Unitree G1（货架 23DoF 机型）的 sim2sim / SDK sim2real-in-sim 工作区。
 
+**新机器请先读 [SETUP.md](SETUP.md)**（依赖、编译、打补丁、跑 FSM）。本 README 只作速览。
+
 包含两条策略路径：
 
 - **RMG `model_24500`**：`mage_round2_model24500_sim2sim_bundle/`（21 主动关节）
@@ -19,34 +21,29 @@ git clone https://github.com/unitreerobotics/unitree_mujoco.git
 git clone -b releases/0.10.x https://github.com/eclipse-cyclonedds/cyclonedds.git
 ```
 
-`unitree_mujoco` 相对上游有本地补丁（本仓库跟踪这些文件）：
+然后执行：
 
-- `unitree_mujoco/simulate/src/main.cc` — BeyondMimic 动力学调节；等首帧 `rt/lowcmd` 再解暂停
-- `unitree_mujoco/simulate/src/unitree_sdk2_bridge.h` — LowCmd 超时前 PD 锁站姿
-- `unitree_mujoco/unitree_robots/g1/g1_23dof.xml` / `scene_23dof.xml` — 接触与 keyframe
-- `unitree_mujoco/simulate/config.yaml` — G1、`scene_23dof.xml`、DDS `lo`、手柄 `use_joystick: 1`
+```bash
+./scripts/apply_unitree_mujoco_patches.sh
+```
 
-也可把 `configs/unitree_mujoco.simulate.config.yaml` 拷到 `unitree_mujoco/simulate/config.yaml`。
+补丁说明见 [SETUP.md](SETUP.md)。也可把 `configs/unitree_mujoco.simulate.config.yaml` 拷到 `unitree_mujoco/simulate/config.yaml`。
 
 ## BeyondMimic FSM sim2real-in-sim（推荐演示）
 
-终端 1：
+完整步骤见 SETUP。摘要：
 
 ```bash
+# 终端 1
 export DISPLAY=:1
 ./unitree_mujoco/simulate/build/unitree_mujoco
-```
 
-终端 2：
-
-```bash
+# 终端 2
 conda activate unitree_rl_mjlab
 export CYCLONEDDS_HOME=$PWD/cyclonedds/install
 cd beyondmimic_sim2real
 python g1_beyondmimic_fsm_sdk_lo.py --network lo
 ```
-
-默认 `STAND_UP` → `READY_STAND`（hold）。按键：
 
 | 功能 | 键盘 | 手柄（Xbox） |
 |---|---|---|
@@ -56,7 +53,7 @@ python g1_beyondmimic_fsm_sdk_lo.py --network lo
 | 阻尼 | D | Y |
 | 退出 | Q / Esc | Select |
 
-无手柄时把 `use_joystick` 改回 `0`，否则仿真打不开 `/dev/input/js0` 会退出。
+无手柄时把 `use_joystick` 改回 `0`。
 
 ## RMG Python sim2sim
 
