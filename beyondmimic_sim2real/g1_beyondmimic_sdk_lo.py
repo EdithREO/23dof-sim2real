@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """BeyondMimic walk1 on unitree_mujoco via SDK/DDS (sim2real-in-sim).
 
-This is not the RMG 327-dim script. It uses Tracking-Flat-G123-v0 (130-dim obs,
+This is not the RMG 327-dim script. It uses Tracking-Flat-G123-Wo-State-Estimation-v0
+(124-dim obs without motion_anchor_pos_b / base_lin_vel),
 23 actions, time_step) and talks LowState/LowCmd on --network lo.
 
   Terminal 1:  ./unitree_mujoco   (already configured for g1 / lo)
@@ -173,7 +174,7 @@ def align_motion_to_robot(motion_pos, motion_quat, src_pos, src_quat, dst_pos, d
 
 
 class RobotIO:
-    def __init__(self):
+    def __init__(self, subscribe_sport: bool = True):
         self._lock = threading.Lock()
         self.low_state: LowStateHG | None = None
         self.sport: SportModeState_ | None = None
@@ -187,8 +188,10 @@ class RobotIO:
         # These callbacks only replace a reference under a lock, so running
         # them directly in the DDS listener is both safe and low latency.
         self.low_sub.Init(self._on_low)
-        self.sport_sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
-        self.sport_sub.Init(self._on_sport)
+        self.sport_sub = None
+        if subscribe_sport:
+            self.sport_sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+            self.sport_sub.Init(self._on_sport)
 
     def _on_low(self, msg: LowStateHG):
         with self._lock:
@@ -611,12 +614,8 @@ def main() -> None:
             o = 0
             obs[o : o + 46] = motion_cmd
             o += 46
-            obs[o : o + 3] = anchor_pos
-            o += 3
             obs[o : o + 6] = anchor_ori
             o += 6
-            obs[o : o + 3] = base_lin
-            o += 3
             obs[o : o + 3] = gyro_f
             o += 3
             obs[o : o + d.NUM_ACTIONS] = q_pol - default_seq
@@ -624,7 +623,7 @@ def main() -> None:
             obs[o : o + d.NUM_ACTIONS] = dq_pol
             o += d.NUM_ACTIONS
             obs[o : o + d.NUM_ACTIONS] = action_buffer
-
+            _ = (anchor_pos, base_lin)
             action = session.run(
                 ["actions"],
                 {

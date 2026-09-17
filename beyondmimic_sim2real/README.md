@@ -30,3 +30,18 @@ python g1_beyondmimic_power_on.py --network enpXs0 --allow-real
 ```bash
 python g1_beyondmimic_fsm_sdk_lo.py --network lo
 ```
+
+此 FSM 使用 **124 维观测、LowState-only 反馈**，不订阅或等待
+`rt/sportmodestate`。躯干姿态由 IMU 四元数与腰部 yaw 计算，参考动作仅进行
+yaw 姿态对齐；策略输入顺序、关节映射和动作缩放保持不变。
+
+移除了基于仿真根高度的跌倒、恢复站立和安全 hold 判据，保留 IMU 倾角、
+角速度、关节速度及 LowState 超时保护。倾角无法确认离地高度或识别所有塌腿
+情况；从阻尼重新站立前需要操作者确认机器人已复位/得到支撑。
+这不是完整真机安全方案，FSM 仍只允许 `--network lo`。
+
+离线回归测试（不初始化 DDS，不发送电机指令）：
+
+```bash
+python -m unittest discover -s tests -v
+```

@@ -21,6 +21,9 @@ Gamepad (unitree_mujoco use_joystick=1 → LowState.wireless_remote):
 
 This program is deliberately restricted to --network lo.  It is a simulator
 validation tool, not a real-robot executable.
+
+Feedback is LowState-only: no SportModeState or root-height estimate.
+Tilt protection cannot detect every fall (e.g. an upright collapse).
 """
 from __future__ import annotations
 
@@ -65,6 +68,7 @@ else:
 class ControlState(enum.Enum):
     STAND_UP = "STAND_UP"
     READY_STAND = "READY_STAND"
+    POLICY_BLEND = "POLICY_BLEND"
     POLICY = "POLICY"
     POLICY_HOLD = "POLICY_HOLD"
     DAMPING = "DAMPING"
@@ -84,6 +88,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint_limit_margin", type=float, default=0.03)
     parser.add_argument("--stand_s", type=float, default=3.0)
     parser.add_argument(
+        "--policy_blend_s",
+        type=float,
+        default=2.0,
+        help="seconds to smoothly hand off stand PD to policy; motion is frozen meanwhile",
+    )
+    parser.add_argument(
         "--policy_duration",
         type=float,
         default=0.0,
@@ -96,6 +106,25 @@ def parse_args() -> argparse.Namespace:
         help="disable pynput hotkeys and use terminal commands followed by Enter",
     )
     return parser.parse_args()
+
+
+def align_reference_orientation(
+    reference_quats: np.ndarray, start_frame: int, torso_quat: np.ndarray
+) -> np.ndarray:
+    """Yaw-align torso reference orientations without any position estimate."""
+    delta_yaw = sdk.yaw_wxyz(torso_quat) - sdk.yaw_wxyz(reference_quats[start_frame])
+    delta = sdk.yaw_quat(delta_yaw)
+    q = np.asarray(reference_quats, dtype=np.float64)
+    # Vectorized delta * q, same convention as the previous full-pose alignment.
+    w = delta[0] * q[:, 0] - q[:, 1:] @ delta[1:]
+    xyz = (
+        delta[0] * q[:, 1:]
+        + q[:, :1] * delta[1:]
+        + np.cross(delta[1:], q[:, 1:])
+    )
+    aligned = np.column_stack((w, xyz))
+    aligned /= np.maximum(np.linalg.norm(aligned, axis=1, keepdims=True), 1e-12)
+    return aligned.astype(np.float32)
 
 
 def tick_delta_ms(now: int, then: int) -> int:
@@ -128,6 +157,8 @@ def main() -> None:
         raise SystemExit("--joint_limit_margin must be >= 0")
     if args.stand_s <= 0.0:
         raise SystemExit("--stand_s must be > 0")
+    if args.policy_blend_s <= 0.0:
+        raise SystemExit("--policy_blend_s must be > 0")
 
     cyclonedds_home = REPO_ROOT / "cyclonedds" / "install"
     if not cyclonedds_home.is_dir():
@@ -176,14 +207,14 @@ def main() -> None:
         session.run(["actions"], {"obs": warm_obs, "time_step": warm_step})
 
     ChannelFactoryInitialize(int(args.domain_id), args.network)
-    io = sdk.RobotIO()
+    io = sdk.RobotIO(subscribe_sport=False)
     print(
-        f"[fsm] waiting for LowState + SportModeState on "
+        f"[fsm] waiting for LowState only on "
         f"{args.network} domain={args.domain_id} ..."
     )
-    io.wait()
-    low, sport = io.snapshot()
-    assert low is not None and sport is not None
+    io.wait(need_sport=False)
+    low, _ = io.snapshot()
+    assert low is not None
     q_xml, _ = sdk.xml_from_lowstate(low)
 
     command_lock = threading.Lock()
@@ -233,7 +264,6 @@ def main() -> None:
     last_tick_wall = time.monotonic()
     running = True
 
-    motion_pos: np.ndarray | None = None
     motion_quat: np.ndarray | None = None
     policy_start_tick = state_entry_tick
     timestep = start_frame
@@ -272,12 +302,11 @@ def main() -> None:
         new_state: ControlState,
         tick: int,
         current_q: np.ndarray,
-        torso_pos: np.ndarray,
         torso_quat: np.ndarray,
         reason: str,
     ) -> None:
         nonlocal state, state_entry_tick, transition_q0, ready_q
-        nonlocal motion_pos, motion_quat, policy_start_tick, timestep
+        nonlocal motion_quat, policy_start_tick, timestep
         nonlocal policy_updates, skipped_frames, limit_clip_events, limit_clip_max
         nonlocal action_buffer, action_filtered, obs, stop_requested
 
@@ -288,13 +317,10 @@ def main() -> None:
         state_entry_tick = tick
         transition_q0 = current_q.copy()
 
-        if new_state == ControlState.POLICY:
-            motion_pos, motion_quat = sdk.align_motion_to_robot(
-                motion["body_pos_w"],
-                motion["body_quat_w"],
-                motion["body_pos_w"][start_frame, d.TORSO_BODY_INDEX],
-                motion["body_quat_w"][start_frame, d.TORSO_BODY_INDEX],
-                torso_pos,
+        if new_state == ControlState.POLICY_BLEND:
+            motion_quat = align_reference_orientation(
+                motion["body_quat_w"][:, d.TORSO_BODY_INDEX],
+                start_frame,
                 torso_quat,
             )
             policy_start_tick = tick
@@ -307,8 +333,16 @@ def main() -> None:
             action_buffer[:] = 0.0
             action_filtered[:] = 0.0
             obs[:] = 0.0
-        elif new_state == ControlState.READY_STAND and old_state == ControlState.STAND_UP:
-            ready_q = stand_q.copy()
+        elif new_state == ControlState.POLICY:
+            # Start motion time only after the PD-to-policy handoff completes.
+            policy_start_tick = tick
+            timestep = start_frame
+        elif new_state == ControlState.READY_STAND:
+            ready_q = (
+                stand_q.copy()
+                if old_state == ControlState.STAND_UP
+                else current_q.copy()
+            )
         elif old_state == ControlState.POLICY:
             print(
                 f"[fsm] policy summary: updates={policy_updates} frame={timestep} "
@@ -320,8 +354,8 @@ def main() -> None:
 
     try:
         while running:
-            low, sport = io.snapshot()
-            if low is None or sport is None:
+            low, _ = io.snapshot()
+            if low is None:
                 time.sleep(0.001)
                 continue
 
@@ -347,16 +381,11 @@ def main() -> None:
             imu_quat = np.asarray(low.imu_state.quaternion, dtype=np.float64)
             imu_quat /= max(np.linalg.norm(imu_quat), 1e-8)
             gyro = np.asarray(low.imu_state.gyroscope, dtype=np.float64)
-            pelvis_pos, pelvis_quat, pelvis_lin_w = sdk.imu_to_pelvis(
-                np.asarray(sport.position, dtype=np.float64),
-                imu_quat,
-                np.asarray(sport.velocity, dtype=np.float64),
-                gyro,
-            )
+            # The simulated pelvis IMU has no extra rotation. Verify this
+            # mounting assumption before adapting this simulator entry to hardware.
             waist = float(q_xml[d.JOINT_XML.index("waist_yaw_joint")])
-            torso_pos, torso_quat = sdk.pelvis_to_torso(
-                pelvis_pos, pelvis_quat, waist
-            )
+            torso_quat = d.quaternion_multiply(imu_quat, sdk.yaw_quat(waist))
+            torso_quat /= max(np.linalg.norm(torso_quat), 1e-8)
             rpy = np.asarray(low.imu_state.rpy, dtype=np.float64)
 
             try:
@@ -424,7 +453,6 @@ def main() -> None:
                     ControlState.DAMPING,
                     tick,
                     q_xml,
-                    torso_pos,
                     torso_quat,
                     "operator damping command",
                 )
@@ -433,14 +461,21 @@ def main() -> None:
                     if not stop_requested:
                         print("[fsm] policy stop requested; waiting for a low-motion frame")
                     stop_requested = True
+                elif state == ControlState.POLICY_BLEND:
+                    transition(
+                        ControlState.READY_STAND,
+                        tick,
+                        q_xml,
+                        torso_quat,
+                        "policy handoff cancelled",
+                    )
                 elif state == ControlState.POLICY_HOLD:
                     print(
                         "[fsm] fixed-pose return is unavailable without a "
                         "separate balance policy; press p to restart or d for damping"
                     )
                 elif state == ControlState.DAMPING and (
-                    pelvis_pos[2] < 0.60
-                    or abs(rpy[0]) > 0.35
+                    abs(rpy[0]) > 0.35
                     or abs(rpy[1]) > 0.35
                 ):
                     print(
@@ -452,7 +487,6 @@ def main() -> None:
                         ControlState.STAND_UP,
                         tick,
                         q_xml,
-                        torso_pos,
                         torso_quat,
                         "operator stand command",
                     )
@@ -461,22 +495,28 @@ def main() -> None:
                     if not stop_requested:
                         print("[fsm] policy stop requested; waiting for a low-motion frame")
                     stop_requested = True
+                elif state == ControlState.POLICY_BLEND:
+                    transition(
+                        ControlState.READY_STAND,
+                        tick,
+                        q_xml,
+                        torso_quat,
+                        "operator cancelled policy handoff",
+                    )
             elif console_event == "p" or keyboard_event == "p" or "policy" in remote_events:
                 if state in (ControlState.READY_STAND, ControlState.POLICY_HOLD):
                     transition(
-                        ControlState.POLICY,
+                        ControlState.POLICY_BLEND,
                         tick,
                         q_xml,
-                        torso_pos,
                         torso_quat,
-                        "operator policy start",
+                        "operator policy start -> smooth handoff",
                     )
                 else:
                     print(f"[fsm] policy start ignored in {state.value}")
 
             fallen = (
-                pelvis_pos[2] < 0.45
-                or abs(rpy[0]) > 1.0
+                abs(rpy[0]) > 1.0
                 or abs(rpy[1]) > 1.0
             )
             if fallen and state != ControlState.DAMPING:
@@ -484,10 +524,8 @@ def main() -> None:
                     ControlState.DAMPING,
                     tick,
                     q_xml,
-                    torso_pos,
                     torso_quat,
-                    f"fall detected z={pelvis_pos[2]:.3f} "
-                    f"roll={rpy[0]:.3f} pitch={rpy[1]:.3f}",
+                    f"excessive tilt detected roll={rpy[0]:.3f} pitch={rpy[1]:.3f}",
                 )
 
             if state == ControlState.DAMPING:
@@ -504,7 +542,6 @@ def main() -> None:
                         ControlState.READY_STAND,
                         tick,
                         q_xml,
-                        torso_pos,
                         torso_quat,
                         "stand interpolation complete",
                     )
@@ -514,8 +551,12 @@ def main() -> None:
                 publish_target(ready_q, stand_kp, stand_kd)
                 continue
 
-            assert state in (ControlState.POLICY, ControlState.POLICY_HOLD)
-            assert motion_pos is not None and motion_quat is not None
+            assert state in (
+                ControlState.POLICY_BLEND,
+                ControlState.POLICY,
+                ControlState.POLICY_HOLD,
+            )
+            assert motion_quat is not None
             if state == ControlState.POLICY:
                 policy_elapsed_ms = tick_delta_ms(tick, policy_start_tick)
                 if (
@@ -533,7 +574,6 @@ def main() -> None:
                         ControlState.POLICY_HOLD,
                         tick,
                         q_xml,
-                        torso_pos,
                         torso_quat,
                         "motion complete; freezing final reference",
                     )
@@ -547,7 +587,6 @@ def main() -> None:
                         ControlState.DAMPING,
                         tick,
                         q_xml,
-                        torso_pos,
                         torso_quat,
                         "clock discontinuity",
                     )
@@ -574,7 +613,6 @@ def main() -> None:
                     and ref_base_angular_speed < 0.35
                     and measured_joint_speed < 1.0
                     and measured_tilt_rate < 0.7
-                    and pelvis_pos[2] > 0.60
                     and abs(rpy[0]) < 0.35
                     and abs(rpy[1]) < 0.35
                 )
@@ -583,7 +621,6 @@ def main() -> None:
                         ControlState.POLICY_HOLD,
                         tick,
                         q_xml,
-                        torso_pos,
                         torso_quat,
                         "low-motion frame reached; reference frozen",
                     )
@@ -592,32 +629,23 @@ def main() -> None:
             motion_cmd = np.concatenate(
                 [motion["joint_pos"][timestep], motion["joint_vel"][timestep]]
             ).astype(np.float32)
-            anchor_pos, anchor_quat = d.subtract_frame_transforms_mujoco(
-                torso_pos.astype(np.float32),
-                torso_quat.astype(np.float32),
-                motion_pos[timestep, d.TORSO_BODY_INDEX],
-                motion_quat[timestep, d.TORSO_BODY_INDEX],
+            anchor_quat = d.quaternion_multiply(
+                d.quaternion_conjugate(torso_quat), motion_quat[timestep]
             )
+            anchor_quat /= max(np.linalg.norm(anchor_quat), 1e-8)
             anchor_matrix = np.zeros(9, dtype=np.float64)
             mujoco.mju_quat2Mat(anchor_matrix, anchor_quat)
             anchor_ori = (
                 anchor_matrix.reshape(3, 3)[:, :2].reshape(-1).astype(np.float32)
             )
-            base_lin = d.quat_rotate_inverse_np(
-                pelvis_quat, pelvis_lin_w
-            ).astype(np.float32)
             q_policy = d.xml_to_policy(q_xml, joint_seq)
             dq_policy = d.xml_to_policy(dq_xml, joint_seq)
 
             offset = 0
             obs[offset : offset + 46] = motion_cmd
             offset += 46
-            obs[offset : offset + 3] = anchor_pos
-            offset += 3
             obs[offset : offset + 6] = anchor_ori
             offset += 6
-            obs[offset : offset + 3] = base_lin
-            offset += 3
             obs[offset : offset + 3] = gyro.astype(np.float32)
             offset += 3
             obs[offset : offset + d.NUM_ACTIONS] = q_policy - default_seq
@@ -625,7 +653,6 @@ def main() -> None:
             obs[offset : offset + d.NUM_ACTIONS] = dq_policy
             offset += d.NUM_ACTIONS
             obs[offset : offset + d.NUM_ACTIONS] = action_buffer
-
             action = session.run(
                 ["actions"],
                 {
@@ -648,16 +675,36 @@ def main() -> None:
             limit_clip_max = max(
                 limit_clip_max, float(np.max(np.abs(raw_target - target)))
             )
-            publish_target(target, stiffness_xml, damping_xml)
+            was_policy_blend = state == ControlState.POLICY_BLEND
+            if was_policy_blend:
+                blend_elapsed = tick_delta_ms(tick, state_entry_tick) * 1e-3
+                blend = float(np.clip(blend_elapsed / args.policy_blend_s, 0.0, 1.0))
+                # Smoothstep has zero slope at both ends, avoiding a target-velocity
+                # impulse when policy takeover starts or completes.
+                blend = blend * blend * (3.0 - 2.0 * blend)
+                target = (1.0 - blend) * transition_q0 + blend * target
+                kp = (1.0 - blend) * stand_kp + blend * stiffness_xml
+                kd = (1.0 - blend) * stand_kd + blend * damping_xml
+                publish_target(target, kp, kd)
+                if blend >= 1.0:
+                    transition(
+                        ControlState.POLICY,
+                        tick,
+                        q_xml,
+                        torso_quat,
+                        "smooth policy handoff complete",
+                    )
+            else:
+                publish_target(target, stiffness_xml, damping_xml)
             policy_updates += 1
-            if state == ControlState.POLICY:
+            if state == ControlState.POLICY and not was_policy_blend:
                 timestep += 1
 
             if policy_updates % 50 == 0:
                 q_error = target - q_xml
                 print(
-                    f"[fsm] {state.value} frame={timestep} z={pelvis_pos[2]:.3f} "
-                    f"|anchor|={np.linalg.norm(anchor_pos):.3f} "
+                    f"[fsm] {state.value} frame={timestep} "
+                    f"roll={rpy[0]:.3f} pitch={rpy[1]:.3f} "
                     f"qerr_rms={np.sqrt(np.mean(q_error * q_error)):.3f} "
                     f"limit_clips={limit_clip_events} "
                     f"clip_max={limit_clip_max:.3f}rad"

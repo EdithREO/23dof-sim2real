@@ -227,7 +227,12 @@ def main() -> None:
                 q_now, _ = sdk.xml_from_lowstate(low)
                 publish_target(q_now, damping_kp, damping_kd)
                 transition(PowerState.DAMPING, tick, q_now, "stale lowstate")
-                exit_after_damping = True
+                # No fresh robot clock remains to advance the control loop.
+                # Publish damping briefly, then leave instead of repeating this
+                # branch forever with the same stale tick.
+                time.sleep(0.2)
+                running = False
+                continue
 
             if (
                 last_control_tick is not None

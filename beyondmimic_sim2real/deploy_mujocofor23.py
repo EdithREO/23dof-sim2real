@@ -1,4 +1,9 @@
-"""MuJoCo sim2sim for BeyondMimic G1 23DoF (Tracking-Flat-G123-v0, 130-dim obs).
+"""MuJoCo sim2sim for BeyondMimic G1 23DoF.
+
+Default obs layout matches Tracking-Flat-G123-Wo-State-Estimation-v0 (124-dim):
+  command(46) + motion_anchor_ori_b(6) + base_ang_vel(3)
+  + joint_pos(23) + joint_vel(23) + actions(23)
+i.e. no motion_anchor_pos_b / base_lin_vel (unavailable on real LowState-only deploy).
 
 Why it could not stand:
   1) Spawn near XML origin while motion starts at pelvis~(1.5, 4.5, 0.8)
@@ -15,10 +20,8 @@ motion frame 0 and start the tracking policy.
 
 Run:
   conda activate unitree_rl_mjlab
-  cd /home/liuboqian_/Project/Byondmimic-23dof/Deploy
+  cd beyondmimic_sim2real
   python deploy_mujocofor23.py
-  python deploy_mujocofor23.py --start_mode policy
-  python deploy_mujocofor23.py --start_mode policy --start_frame 10 --policy_kp_scale 4
 """
 
 from __future__ import annotations
@@ -51,7 +54,8 @@ KEY_R = 82
 KEY_P = 80
 
 NUM_ACTIONS = 23
-NUM_OBS = 130
+# Wo-State-Estimation policy obs (no anchor_pos / base_lin_vel).
+NUM_OBS = 124
 TORSO_BODY_INDEX = 3  # full npz: pelvis=0, torso_link=3
 
 ARMATURE_BY_JOINT = {
@@ -362,6 +366,13 @@ def main():
     print("[INFO] ONNX inputs:", in_names)
     if "obs" not in in_names or "time_step" not in in_names:
         raise RuntimeError(f"unexpected ONNX inputs: {in_names}")
+    obs_dim = int(session.get_inputs()[in_names.index("obs")].shape[-1])
+    if obs_dim != NUM_OBS:
+        raise RuntimeError(
+            f"ONNX obs dim {obs_dim} != deploy NUM_OBS {NUM_OBS}; "
+            "packing must match observation_names (Wo-SE 124)."
+        )
+    print(f"[INFO] obs dim aligned: {obs_dim}")
 
     model = mujoco.MjModel.from_xml_path(XML_PATH)
     data = mujoco.MjData(model)
@@ -483,12 +494,8 @@ def main():
                 o = 0
                 obs[o : o + 46] = motion_cmd
                 o += 46
-                obs[o : o + 3] = anchor_pos
-                o += 3
                 obs[o : o + 6] = anchor_ori
                 o += 6
-                obs[o : o + 3] = base_lin_vel
-                o += 3
                 obs[o : o + 3] = base_ang_vel
                 o += 3
                 obs[o : o + NUM_ACTIONS] = q_policy - default_seq
@@ -496,7 +503,9 @@ def main():
                 obs[o : o + NUM_ACTIONS] = dq_policy
                 o += NUM_ACTIONS
                 obs[o : o + NUM_ACTIONS] = action_buffer
-
+                o += NUM_ACTIONS
+                if o != NUM_OBS:
+                    raise RuntimeError(f"obs pack length {o} != NUM_OBS {NUM_OBS}")
                 action = session.run(
                     ["actions"],
                     {
